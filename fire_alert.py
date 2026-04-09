@@ -3,8 +3,16 @@ import logging
 import requests
 import math
 import asyncio
+from datetime import datetime
 import paho.mqtt.client as mqtt
 from telegram import Bot
+import sys
+import io
+
+# Force UTF-8 for Windows console emoji support
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+
 
 # ---------------- CONFIGURATION ---------------- #
 MQTT_BROKER = "broker.hivemq.com"
@@ -93,6 +101,32 @@ def find_emergency_services(lat, lon):
         logging.error(f"Error querying Overpass API: {e}")
         return [], []
 
+def log_incident_to_file(incident_type, lat, lon, fire_stations, police_stations):
+    """Logs the incident details to a persistent text file."""
+    log_filename = "emergency_incidents.log"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    with open(log_filename, "a", encoding="utf-8") as f:
+        f.write(f"\n=== [{timestamp}] Incident Report ===\n")
+        f.write(f"Type: {incident_type}\n")
+        f.write(f"Location: Lat = {lat}, Lon = {lon}\n")
+        
+        f.write("\n--- Nearest Fire Stations ---\n")
+        for idx, s in enumerate(fire_stations):
+            rank = "Primary" if idx == 0 else "Backup"
+            f.write(f"{rank}: {s['name']} ({s['distance_km']:.2f} km)\n")
+        if not fire_stations: f.write("None found nearby\n")
+
+        f.write("\n--- Nearest Police Stations ---\n")
+        for idx, s in enumerate(police_stations):
+            rank = "Primary" if idx == 0 else "Backup"
+            f.write(f"{rank}: {s['name']} ({s['distance_km']:.2f} km)\n")
+        if not police_stations: f.write("None found nearby\n")
+        
+        f.write("===================================\n")
+    
+    print(f"📖 Incident logged to {log_filename}")
+
 def send_alert(station_id, message):
     station = EMERGENCY_CONTACTS.get(station_id)
     if not station:
@@ -138,22 +172,28 @@ def on_message(client, userdata, msg):
                 fire_lon = float(loc.get("long", loc.get("lon", 0.0)))
                 
                 if fire_lat != 0.0 and fire_lon != 0.0:
-                    # ---------------- FIRE STATIONS ALERT ---------------- #
-                    nearest_fires, _ = find_emergency_services(fire_lat, fire_lon)
+                    # ---------------- EMERGENCY SERVICES FETCH ---------------- #
+                    nearest_fires, nearest_polices = find_emergency_services(fire_lat, fire_lon)
                     
-                    primary_fire = nearest_fires[0] if len(nearest_fires) > 0 else None
-                    backup_fire = nearest_fires[1] if len(nearest_fires) > 1 else None
+                    p_fire = nearest_fires[0] if len(nearest_fires) > 0 else None
+                    b_fire = nearest_fires[1] if len(nearest_fires) > 1 else None
+                    p_police = nearest_polices[0] if len(nearest_polices) > 0 else None
+                    b_police = nearest_polices[1] if len(nearest_polices) > 1 else None
                     
-                    primary_name = primary_fire['name'] if primary_fire else "Unknown Fire Station"
-                    primary_dist = primary_fire['distance_km'] if primary_fire else 0.0
+                    pf_name = p_fire['name'] if p_fire else "Unknown"
+                    pf_dist = p_fire['distance_km'] if p_fire else 0.0
+                    bf_name = b_fire['name'] if b_fire else "Unknown"
+                    bf_dist = b_fire['distance_km'] if b_fire else 0.0
                     
-                    backup_name = backup_fire['name'] if backup_fire else "Unknown Backup Fire Station"
-                    backup_dist = backup_fire['distance_km'] if backup_fire else 0.0
+                    pp_name = p_police['name'] if p_police else "Unknown"
+                    pp_dist = p_police['distance_km'] if p_police else 0.0
+                    bp_name = b_police['name'] if b_police else "Unknown"
+                    bp_dist = b_police['distance_km'] if b_police else 0.0
 
                     maps_link = f"https://maps.google.com/?q={fire_lat},{fire_lon}"
 
                     message = f"""
-🚨 FIRE ALERT 🚨
+🚨 EMERGENCY ALERT: FIRE 🚨
 
 📍 Location:
 Lat: {fire_lat}
@@ -164,15 +204,18 @@ Lon: {fire_lon}
 🔥 Type: {data.get('fire')}
 📊 Confidence: N/A
 
-🚒 Primary Station: {primary_name} ({primary_dist:.2f} km)
-🚑 Backup Station: {backup_name} ({backup_dist:.2f} km)
+🚒 Primary Fire Station: {pf_name} ({pf_dist:.2f} km)
+🚒 Backup Fire Station: {bf_name} ({bf_dist:.2f} km)
+🚓 Primary Police Station: {pp_name} ({pp_dist:.2f} km)
+🚓 Backup Police Station: {bp_name} ({bp_dist:.2f} km)
 """
 
-                    print(f"🎯 Sending to PRIMARY FIRE: {primary_name}")
-                    send_alert("1", message) # Primary Fire token
-
-                    print(f"🛟 Sending to BACKUP FIRE: {backup_name}")
-                    send_alert("2", "⚠ BACKUP ALERT\n\n" + message) # Backup Fire Token
+                    print(f"🎯 Dispatching Fire & Police Alerts...")
+                    for tid in ["1", "2", "3", "4"]:
+                        send_alert(tid, message)
+                    
+                    # Log to file
+                    log_incident_to_file("FIRE", fire_lat, fire_lon, nearest_fires, nearest_polices)
                 else:
                     print("❌ Invalid or Zero coordinates parsed from the payload.")
             else:
@@ -186,22 +229,28 @@ Lon: {fire_lon}
                 threat_lon = float(loc.get("long", loc.get("lon", 0.0)))
 
                 if threat_lat != 0.0 and threat_lon != 0.0:
-                    # ---------------- POLICE ALERT FOR THREATS ---------------- #
-                    _, nearest_polices = find_emergency_services(threat_lat, threat_lon)
+                    # ---------------- EMERGENCY SERVICES FETCH ---------------- #
+                    nearest_fires, nearest_polices = find_emergency_services(threat_lat, threat_lon)
                     
-                    primary_police = nearest_polices[0] if len(nearest_polices) > 0 else None
-                    backup_police = nearest_polices[1] if len(nearest_polices) > 1 else None
+                    p_fire = nearest_fires[0] if len(nearest_fires) > 0 else None
+                    b_fire = nearest_fires[1] if len(nearest_fires) > 1 else None
+                    p_police = nearest_polices[0] if len(nearest_polices) > 0 else None
+                    b_police = nearest_polices[1] if len(nearest_polices) > 1 else None
                     
-                    primary_name = primary_police['name'] if primary_police else "Unknown Police Station"
-                    primary_dist = primary_police['distance_km'] if primary_police else 0.0
-
-                    backup_name = backup_police['name'] if backup_police else "Unknown Backup Police Station"
-                    backup_dist = backup_police['distance_km'] if backup_police else 0.0
+                    pf_name = p_fire['name'] if p_fire else "Unknown"
+                    pf_dist = p_fire['distance_km'] if p_fire else 0.0
+                    bf_name = b_fire['name'] if b_fire else "Unknown"
+                    bf_dist = b_fire['distance_km'] if b_fire else 0.0
+                    
+                    pp_name = p_police['name'] if p_police else "Unknown"
+                    pp_dist = p_police['distance_km'] if p_police else 0.0
+                    bp_name = b_police['name'] if b_police else "Unknown"
+                    bp_dist = b_police['distance_km'] if b_police else 0.0
 
                     maps_link = f"https://maps.google.com/?q={threat_lat},{threat_lon}"
 
                     message = f"""
-🚨 THREAT ALERT 🚨
+🚨 EMERGENCY ALERT: THREAT 🚨
 
 📍 Location:
 Lat: {threat_lat}
@@ -211,14 +260,17 @@ Lon: {threat_lon}
 
 ⚠️ Threat: Suspicious Activity Detected
 
-🚓 Primary Police Station: {primary_name} ({primary_dist:.2f} km)
-🚓 Backup Police Station: {backup_name} ({backup_dist:.2f} km)
+🚓 Primary Police Station: {pp_name} ({pp_dist:.2f} km)
+🚓 Backup Police Station: {bp_name} ({bp_dist:.2f} km)
+🚒 Primary Fire Station: {pf_name} ({pf_dist:.2f} km)
+🚒 Backup Fire Station: {bf_name} ({bf_dist:.2f} km)
 """
-                    print(f"🎯 Suspicious Threat! Dispatching PRIMARY POLICE: {primary_name}")
-                    send_alert("3", message) # Primary Police Token
+                    print(f"🎯 Dispatching Threat & Police Alerts...")
+                    for tid in ["1", "2", "3", "4"]:
+                        send_alert(tid, message)
                     
-                    print(f"🎯 Dispatching BACKUP POLICE: {backup_name}")
-                    send_alert("4", "⚠ BACKUP ALERT\n\n" + message) # Backup Police Token
+                    # Log to file
+                    log_incident_to_file("THREAT", threat_lat, threat_lon, nearest_fires, nearest_polices)
                 else:
                     print("❌ Invalid or Zero coordinates parsed from the threat payload.")
             else:
